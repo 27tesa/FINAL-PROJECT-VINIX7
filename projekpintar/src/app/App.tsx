@@ -19,7 +19,8 @@ import {
   signUpWithRole,
   signIn,
   requestPasswordReset,
-  getProfile,
+  ensureProfile,
+  formatAuthError,
   getUserSummary,
   getUserRecentModules,
   getLeaderboard,
@@ -575,6 +576,7 @@ function DownloadsPage({ userId }: DownloadsPageProps) {
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
 export default function App() {
+  const [authLoading, setAuthLoading] = useState(true);
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [role, setRole] = useState<Role>("student");
   const [userName, setUserName] = useState("");
@@ -589,37 +591,58 @@ export default function App() {
   const [subjectProgress, setSubjectProgress] = useState<any[]>([]);
   const [leaderboardData, setLeaderboardData] = useState<any[]>([]);
 
-  const restoreSession = async () => {
-    const { data, error } = await supabase.auth.getSession();
-    if (error || !data?.session) return;
-    const sessionUserId = data.session.user.id;
-    setUserId(sessionUserId);
+  const applyUserSession = async (sessionUser: { id: string; email?: string; user_metadata?: Record<string, unknown> }) => {
+    setUserId(sessionUser.id);
     setIsLoggedIn(true);
-    const profile = await getProfile(sessionUserId);
+    setAuthError(null);
+
+    const profile = await ensureProfile(
+      sessionUser.id,
+      sessionUser.email,
+      sessionUser.user_metadata as Parameters<typeof ensureProfile>[2],
+    );
+
     if (profile) {
       setRole(profile.role ?? "student");
-      setUserName(profile.full_name ?? profile.email ?? "");
+      setUserName(profile.full_name ?? profile.email ?? sessionUser.email ?? "");
+    } else {
+      setRole((sessionUser.user_metadata?.role as Role) ?? "student");
+      setUserName((sessionUser.user_metadata?.full_name as string) ?? sessionUser.email ?? "");
     }
   };
 
+  const clearUserSession = () => {
+    setUserId(null);
+    setIsLoggedIn(false);
+    setUserName("");
+    setRole("student");
+  };
+
   useEffect(() => {
-    restoreSession();
+    let mounted = true;
+
+    const initAuth = async () => {
+      const { data, error } = await supabase.auth.getSession();
+      if (!mounted) return;
+      if (!error && data.session?.user) {
+        await applyUserSession(data.session.user);
+      }
+      setAuthLoading(false);
+    };
+
+    initAuth();
+
     const { data: authListener } = supabase.auth.onAuthStateChange(async (_event, session) => {
-      const signedInUserId = session?.user?.id ?? null;
-      setUserId(signedInUserId);
-      setIsLoggedIn(Boolean(signedInUserId));
-      if (signedInUserId) {
-        const profile = await getProfile(signedInUserId);
-        if (profile) {
-          setRole(profile.role ?? "student");
-          setUserName(profile.full_name ?? profile.email ?? "");
-        }
+      if (!mounted) return;
+      if (session?.user) {
+        await applyUserSession(session.user);
       } else {
-        setUserName("");
-        setRole("student");
+        clearUserSession();
       }
     });
+
     return () => {
+      mounted = false;
       authListener.subscription.unsubscribe();
     };
   }, []);
@@ -651,44 +674,25 @@ export default function App() {
           bio: bio || (selectedRole === "teacher" ? "Guru berpengalaman." : "Siswa yang rajin belajar."),
         });
 
-        const sessionUserId = signUpResult?.user?.id ?? signUpResult?.session?.user?.id ?? null;
-        if (sessionUserId) {
-          const profile = await getProfile(sessionUserId);
-          if (profile) {
-            setRole(profile.role ?? selectedRole);
-            setUserName(profile.full_name ?? email ?? "");
-          } else {
-            setRole(selectedRole);
-            setUserName(name ?? email ?? "");
-          }
-          setUserId(sessionUserId);
-          setIsLoggedIn(true);
+        const sessionUser = signUpResult?.session?.user ?? null;
+        if (sessionUser) {
+          await applyUserSession(sessionUser);
           setCurrentPage("dashboard");
-          return;
         }
-
         return;
       }
 
       if (!email || !password) throw new Error("Email dan password harus diisi.");
       const res = await signIn(email, password);
-      const sessionUserId = res?.user?.id ?? res?.session?.user?.id ?? null;
-      if (sessionUserId) {
-        const profile = await getProfile(sessionUserId);
-        if (profile) {
-          setRole(profile.role ?? selectedRole);
-          setUserName(profile.full_name ?? email ?? "");
-        } else {
-          setRole(selectedRole);
-          setUserName(name ?? email ?? "");
-        }
-      }
-      setUserId(sessionUserId ?? null);
-      setIsLoggedIn(true);
+      const sessionUser = res?.session?.user ?? res?.user ?? null;
+      if (!sessionUser) throw new Error("Login gagal. Periksa email dan password Anda.");
+      await applyUserSession(sessionUser);
       setCurrentPage("dashboard");
-    } catch (err: any) {
-      setAuthError(err?.message ?? String(err));
-      throw err;
+    } catch (err: unknown) {
+      const message = formatAuthError(err);
+      setAuthError(message);
+      clearUserSession();
+      throw new Error(message);
     }
   };
 
@@ -732,13 +736,8 @@ export default function App() {
   };
 
   const handleForgotPassword = async (email?: string) => {
-    if (!email) return;
-    try {
-      await requestPasswordReset(email);
-      window.alert(`Email reset password telah dikirim ke ${email}. Periksa kotak masuk Anda.`);
-    } catch (err: any) {
-      window.alert(`Gagal mengirim email reset: ${err?.message ?? String(err)}`);
-    }
+    if (!email) throw new Error("Masukkan email untuk mereset password.");
+    await requestPasswordReset(email);
   };
 
   const handleLogout = async () => {
@@ -747,6 +746,14 @@ export default function App() {
     setUserId(null);
     setCurrentPage("dashboard");
   };
+
+  if (authLoading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+        <p className="text-gray-500 text-sm">Memuat sesi...</p>
+      </div>
+    );
+  }
 
   if (!isLoggedIn) {
     return <LoginPage onLogin={handleLogin} onForgotPassword={handleForgotPassword} authError={authError ?? undefined} supabaseConfigured={isSupabaseConfigured} />;

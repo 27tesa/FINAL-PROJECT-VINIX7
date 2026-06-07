@@ -33,6 +33,7 @@ export function LoginPage({ onLogin, onForgotPassword, authError, supabaseConfig
   const [gradeLevel, setGradeLevel] = useState("");
   const [bio, setBio] = useState("");
   const [message, setMessage] = useState<string | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
   const [forgotError, setForgotError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -51,16 +52,29 @@ export function LoginPage({ onLogin, onForgotPassword, authError, supabaseConfig
       return handleForgotSubmit();
     }
     if (!email || !password) return;
+    if (isRegister && !name.trim()) {
+      setFormError("Nama lengkap wajib diisi untuk pendaftaran.");
+      return;
+    }
+    if (password.length < 6) {
+      setFormError("Password minimal 6 karakter.");
+      return;
+    }
 
     setSubmitting(true);
     setMessage(null);
+    setFormError(null);
     setForgotError(null);
     try {
       await onLogin({ selectedRole, email, password, name, school, className, gradeLevel, bio, isRegister });
       if (isRegister) {
-        setMessage("Pendaftaran berhasil. Silakan masuk terlebih dahulu.");
+        setMessage("Pendaftaran berhasil! Periksa email Anda untuk konfirmasi akun, lalu masuk. (Cek folder spam jika tidak ada.)");
         setIsRegister(false);
+        setPassword("");
       }
+    } catch (err: unknown) {
+      const message = (err as { message?: string })?.message ?? String(err);
+      setFormError(message);
     } finally {
       setSubmitting(false);
     }
@@ -294,6 +308,7 @@ export function LoginPage({ onLogin, onForgotPassword, authError, supabaseConfig
             )}
 
             {message && <p className="text-sm text-green-600 bg-green-50 border border-green-200 rounded-xl px-3 py-2">{message}</p>}
+            {formError && !forgotMode && <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-xl px-3 py-2">{formError}</p>}
             {forgotError && <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-xl px-3 py-2">{forgotError}</p>}
             {authError && !forgotMode && <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-xl px-3 py-2">{authError}</p>}
 
@@ -312,7 +327,14 @@ export function LoginPage({ onLogin, onForgotPassword, authError, supabaseConfig
 
           <div className="mt-6 text-center text-sm text-gray-500">
             {isRegister ? "Sudah punya akun?" : "Belum punya akun?"}{" "}
-            <button onClick={() => setIsRegister(!isRegister)} className="text-blue-600 font-medium hover:text-blue-700">
+            <button
+              onClick={() => {
+                setIsRegister(!isRegister);
+                setFormError(null);
+                setMessage(null);
+              }}
+              className="text-blue-600 font-medium hover:text-blue-700"
+            >
               {isRegister ? "Masuk" : "Daftar Gratis"}
             </button>
           </div>

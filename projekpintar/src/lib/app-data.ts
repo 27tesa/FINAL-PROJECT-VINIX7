@@ -23,14 +23,90 @@ export interface SignUpProfile {
   bio: string;
 }
 
+type ProfileMetadata = {
+  full_name?: string;
+  role?: string;
+  school?: string;
+  class_name?: string;
+  grade_level?: string;
+  bio?: string;
+};
+
+export function formatAuthError(error: unknown): string {
+  const message = (error as { message?: string })?.message ?? String(error);
+
+  if (/email not confirmed/i.test(message)) {
+    return "Email belum dikonfirmasi. Periksa kotak masuk (dan folder spam), klik link konfirmasi, lalu coba masuk lagi.";
+  }
+  if (/invalid login credentials/i.test(message)) {
+    return "Email atau password salah. Jika baru mendaftar, pastikan email sudah dikonfirmasi terlebih dahulu.";
+  }
+  if (/email rate limit exceeded/i.test(message)) {
+    return "Terlalu banyak percobaan. Tunggu beberapa menit lalu coba lagi.";
+  }
+  if (/user already registered/i.test(message)) {
+    return "Email sudah terdaftar. Silakan masuk atau gunakan fitur lupa password.";
+  }
+  if (/password should be at least/i.test(message)) {
+    return "Password minimal 6 karakter.";
+  }
+  if (/unable to validate email/i.test(message)) {
+    return "Format email tidak valid.";
+  }
+  if (/signup is disabled/i.test(message)) {
+    return "Pendaftaran akun baru sedang dinonaktifkan.";
+  }
+
+  return message;
+}
+
+function profileFromMetadata(
+  userId: string,
+  email: string | undefined,
+  metadata: ProfileMetadata | undefined,
+): ProfileRecord {
+  const role = (metadata?.role ?? "student") as ProfileRecord["role"];
+  const dbRole = role === "donor" ? "student" : role;
+
+  return {
+    user_id: userId,
+    full_name: metadata?.full_name ?? email?.split("@")[0] ?? "Pengguna",
+    email: email ?? "",
+    role: dbRole,
+    school: metadata?.school ?? "",
+    class_name: metadata?.class_name ?? "",
+    grade_level: metadata?.grade_level ?? "",
+    bio: metadata?.bio ?? "",
+    avatar_url: null,
+  };
+}
+
+export async function ensureProfile(
+  userId: string,
+  email?: string,
+  metadata?: ProfileMetadata,
+) {
+  try {
+    const existing = await getProfile(userId);
+    if (existing) return existing;
+
+    return await upsertProfile(profileFromMetadata(userId, email, metadata));
+  } catch (err) {
+    console.warn("ensureProfile failed", err);
+    try {
+      return await getProfile(userId);
+    } catch {
+      return null;
+    }
+  }
+}
+
 export async function signUpWithRole(payload: SignUpProfile) {
   if (!isSupabaseConfigured) {
     throw new Error("Supabase belum dikonfigurasi. Pastikan VITE_SUPABASE_URL dan VITE_SUPABASE_ANON_KEY tersedia.");
   }
   const { fullName, email, password, role, school, class_name, grade_level, bio } = payload;
-  const dbRole = role === "donor" ? "student" : role;
 
-  // create account
   const { data, error } = await supabase.auth.signUp({
     email,
     password,
@@ -38,40 +114,45 @@ export async function signUpWithRole(payload: SignUpProfile) {
       data: {
         full_name: fullName,
         role,
+        school,
+        class_name,
+        grade_level,
+        bio,
       },
     },
   });
 
-  if (error) throw error;
+  if (error) throw new Error(formatAuthError(error));
 
   const createdUserId = data.user?.id ?? null;
 
-  if (createdUserId) {
-    // ensure profile exists
-    await upsertProfile({
-      user_id: createdUserId,
-      full_name: fullName,
-      email: data.user?.email ?? email,
-      role: dbRole,
-      school,
-      class_name,
-      grade_level,
-      bio,
-      avatar_url: null,
-    });
+  if (createdUserId && data.session) {
+    try {
+      await ensureProfile(createdUserId, data.user?.email ?? email, data.user?.user_metadata);
+    } catch (profileErr) {
+      console.warn("Profile creation deferred until next sign-in", profileErr);
+    }
   }
 
-  // Try to sign in immediately (works when email confirmation not required or auto-confirm enabled)
-  try {
-    const { data: signInData, error: signInErr } = await supabase.auth.signInWithPassword({ email, password });
-    if (signInErr) {
-      // if sign in fails, return the signUp response so caller can handle (e.g. require confirmation)
-      return data;
-    }
-    return signInData;
-  } catch (err) {
+  if (data.session) {
     return data;
   }
+
+  try {
+    const { data: signInData, error: signInErr } = await supabase.auth.signInWithPassword({ email, password });
+    if (!signInErr && signInData.session?.user) {
+      await ensureProfile(
+        signInData.session.user.id,
+        signInData.session.user.email ?? email,
+        signInData.session.user.user_metadata,
+      );
+      return signInData;
+    }
+  } catch (err) {
+    console.warn("Auto sign-in after registration skipped", err);
+  }
+
+  return data;
 }
 
 export async function signIn(email: string, password: string) {
@@ -79,7 +160,17 @@ export async function signIn(email: string, password: string) {
     throw new Error("Supabase belum dikonfigurasi. Pastikan VITE_SUPABASE_URL dan VITE_SUPABASE_ANON_KEY tersedia.");
   }
   const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-  if (error) throw error;
+  if (error) throw new Error(formatAuthError(error));
+
+  if (!data.session?.user && !data.user) {
+    throw new Error("Login gagal. Tidak ada sesi aktif — periksa apakah email sudah dikonfirmasi.");
+  }
+
+  const user = data.user ?? data.session?.user;
+  if (user) {
+    await ensureProfile(user.id, user.email ?? email, user.user_metadata);
+  }
+
   return data;
 }
 
@@ -87,8 +178,9 @@ export async function requestPasswordReset(email: string) {
   if (!isSupabaseConfigured) {
     throw new Error("Supabase belum dikonfigurasi. Pastikan VITE_SUPABASE_URL dan VITE_SUPABASE_ANON_KEY tersedia.");
   }
-  const { data, error } = await supabase.auth.resetPasswordForEmail(email);
-  if (error) throw error;
+  const redirectTo = typeof window !== "undefined" ? window.location.origin : undefined;
+  const { data, error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo });
+  if (error) throw new Error(formatAuthError(error));
   return data;
 }
 
